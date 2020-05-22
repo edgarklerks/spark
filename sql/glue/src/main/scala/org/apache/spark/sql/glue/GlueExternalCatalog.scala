@@ -24,52 +24,92 @@ import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTab
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.catalyst.analysis.{DatabaseAlreadyExistsException, TableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogStorageFormat, CatalogTable, CatalogTablePartition, ExternalCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.types.{BooleanType, CharType, StringType, StructType, VarcharType}
+import org.apache.spark.sql.types.StructType
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 private[spark] object GlueExternalCatalog {
+  /**
+   * Used to set an explicit catalog id. If not set in the options then the current aws account id is assumed.
+   */
   private val catalogIdOption = "spark.sql.metastore.glue.catalogid"
+  /**
+   * The clients should be thread safe, so can be shared.
+   */
   private val sts = AWSSecurityTokenServiceClientBuilder.defaultClient()
   private val glue = AWSGlueClientBuilder.defaultClient()
 
+  /**
+   * Glue is a rest API so we keep the current database  we are working on locally.
+   */
   private val currentDatabase = new ThreadLocal[Option[String]] {
     override def initialValue(): Option[String] = None
   }
 
+  /**
+   * Get the current database unless the db parameter is set then return that.
+   * Asserts that one of them is set
+   * @param db database that overrides the current database setting
+   * @return a database name
+   */
   private def getCurrentDatabase(db: Option[String]): String = {
     val dbName = db.orElse(currentDatabase.get())
     assert(dbName.isDefined)
     dbName.get
   }
 
-  case class GlueColumns(schema: StructType, bucketSpec: Option[BucketSpec], partitionColumnNames : Seq[String]) {
+  /**
+   * Intermediate type that combines all the information needed to create a TableInput
+   * @param schema a Structype representing the schema of the table
+   * @param bucketSpec a bucket specification, may be null
+   * @param partitionColumnNames the names of the partition columns
+   */
+  case class GlueColumns(private val schema: StructType, private val bucketSpec: Option[BucketSpec], private val partitionColumnNames : Seq[String]) {
+    val hasBucketSpec = bucketSpec.isDefined
+    /** Set to safe values we can always feed to glue without hurting ourselves  */
+    val numberOfBucketColumns = bucketSpec.map(_.numBuckets).getOrElse(0)
+    /** Bucket columns may be empty */
     val bucketColumns: Seq[String] = bucketSpec.toSeq.flatMap(_.bucketColumnNames)
+    /**
+     * Not sure yet if spark and glue are fully compatible, so perhaps not all columns are supported.
+     * TODO: Needs to be tested
+     */
     private val allColumns = schema.map(col => {
       new Column()
         .withName(col.name)
         .withType(col.dataType.catalogString)
     })
     val columns = allColumns.filterNot(partitionColumnNames.contains(_))
+    /**
+     * In glue it seems the partition columns are not part of the normal columns, so they need to be divided.
+     * Also the partition columns need to carry their type, because they are not part of the normal columns
+     */
     val partitionKeys = allColumns.filterNot(partitionColumnNames.contains(_))
   }
 
 
   /**
-   * TODO: Fill in serde info and sort columns
-   * @param catalogStorageFormat
-   * @param glueColumns
-   * @return
+   * Converts a [[CatalogStorageFormat]] together with the columns ([[GlueColumns]] into a [[StorageDescriptor]]
+   * @param catalogStorageFormat the storage format of the table
+   * @param glueColumns the columns of the table
+   * @return a storage descriptor of the table
    */
   private def storageToStorageDescriptor(catalogStorageFormat: CatalogStorageFormat, glueColumns: GlueColumns) : StorageDescriptor = {
+
    val storageDescriptor =  new StorageDescriptor()
-        .withBucketColumns(glueColumns.bucketColumns.asJavaCollection)
         .withColumns(glueColumns.columns.asJavaCollection)
         .withCompressed(catalogStorageFormat.compressed)
+
+    if(glueColumns.hasBucketSpec){
+      storageDescriptor.setBucketColumns(glueColumns.bucketColumns.asJavaCollection)
+      storageDescriptor.setNumberOfBuckets(glueColumns.numberOfBucketColumns)
+    }
+
     catalogStorageFormat.inputFormat match {
       case None =>
       case Some(inp) => storageDescriptor.setInputFormat(inp)
@@ -83,16 +123,40 @@ private[spark] object GlueExternalCatalog {
       case None =>
       case Some(out) => storageDescriptor.setOutputFormat(out)
     }
+
+    /**
+     * For serde it is not needed to set all the properties, {{{catalogStorageFormat.serde}}} maps to the name of the serialization library used.
+     */
+    catalogStorageFormat.serde match {
+      case None =>
+      case Some(serdeLibName) => storageDescriptor.withSerdeInfo(new SerDeInfo().withSerializationLibrary(serdeLibName))
+    }
+
     storageDescriptor
       .withParameters(catalogStorageFormat.properties.asJava)
-      .withSerdeInfo(???)
-      .withSortColumns(???)
   }
 
+  /**
+   * Transforms a [[CatalogTable]] into a [[TableInput]].
+   * @param catalogTable
+   * @return a tableInput describing the table
+   */
   private def catalogTableToTableInput(catalogTable: CatalogTable) : TableInput = {
+
+    /**
+     * Computes the columns, partitionColumns and the bucketColumns
+     */
     val glueColumns  = GlueColumns(catalogTable.schema,catalogTable.bucketSpec,catalogTable.partitionColumnNames)
+
+    /**
+     * withRetention and withLastAnalyzedTime are not set, because there doesn't seem to be anything in [[CatalogTable]] that I can map
+     */
     val tblInput = new TableInput()
       .withName(catalogTable.identifier.table)
+      /**
+       * I guess ignored parameters can be passed on? Perhaps I need to make a namespace for them spark.sql.glue
+       * TODO: Check if this causes problems
+       * */
       .withParameters(catalogTable.ignoredProperties.asJava)
       .withLastAccessTime(new Date(catalogTable.lastAccessTime))
       .withPartitionKeys(glueColumns.partitionKeys.asJavaCollection)
@@ -101,24 +165,6 @@ private[spark] object GlueExternalCatalog {
     tblInput
   }
 
-  private def ignoreIfEntityExist(ignore : Boolean)(x : => Unit) : Unit = {
-    try {
-      x
-    } catch {
-      case e : AlreadyExistsException => {
-        if(!ignore){throw e}
-      }
-    }
-  }
-  def ignoreIfEntityNotExist(ignore : Boolean)(x : => Unit) : Unit = {
-    try {
-      x
-    } catch {
-      case e : EntityNotFoundException => {
-        if(!ignore){ throw e}
-      }
-    }
-  }
   private trait ToIterable[V] {
     /**
      * Q is the supertype of S, it defines that S at least should have the following two methods:
@@ -171,7 +217,7 @@ private[spark] object GlueExternalCatalog {
 private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatalog {
   import GlueExternalCatalog._
 
-  private lazy val catalogId = conf.getOption(catalogId)
+  private lazy val catalogId = conf.getOption(catalogIdOption)
     .getOrElse(
       sts.getCallerIdentity(
         new GetCallerIdentityRequest()
@@ -181,7 +227,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
   override def createDatabase(
                                dbDefinition: CatalogDatabase,
                                ignoreIfExists: Boolean): Unit =
-    ignoreIfEntityExist(ignoreIfExists) {
+    try {
 
       glue.createDatabase(
         new CreateDatabaseRequest()
@@ -194,6 +240,12 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
               .withDescription(dbDefinition.description)
           )
       )
+    } catch {
+      case e : AlreadyExistsException => {
+        if(!ignoreIfExists){
+            throw new DatabaseAlreadyExistsException(dbDefinition.name)
+        }
+      }
     }
 
   private def getTables(db : String, expression : Option[String]) : Iterable[Table] = {
@@ -209,6 +261,13 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
                              db: String,
                              ignoreIfNotExists: Boolean,
                              cascade: Boolean): Unit = {
+    if(!ignoreIfNotExists){
+      requireDbExists(db)
+    }
+
+    /**
+     * Doing a batch delete here, instead of calling dropTable one by one.
+     */
     if(cascade){
       val tables = this.getTables(db, None).map(_.getName)
       glue.batchDeleteTable(
@@ -218,13 +277,11 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
           .withTablesToDelete(tables.asJavaCollection)
       )
     }
-    ignoreIfEntityNotExist(ignoreIfNotExists){
       glue.deleteDatabase(
         new DeleteDatabaseRequest()
           .withCatalogId(catalogId)
           .withName(db)
       )
-    }
   }
 
   /**
@@ -284,19 +341,37 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
   }
 
 
+  /**
+   * Sets the current database, because this is not supported by glue, it is stored thread local.
+   * @param db database name
+   */
   override def setCurrentDatabase(db: String): Unit = {
     currentDatabase.set(Some(db))
   }
 
+  /**
+   * Creates a table as specified by _tableDefinition_ or if it already exists and
+   * {{{ignoreIfExists == false}}} throw exception [[TableAlreadyExistsException]]
+   * @param tableDefinition Definition of table
+   * @param ignoreIfExists Set to simulate `CREATE TABLE IF NOT EXISTS`
+   */
   override def createTable(tableDefinition: CatalogTable, ignoreIfExists: Boolean): Unit = {
     val db = getCurrentDatabase(tableDefinition.identifier.database)
-
-    glue.createTable(
+    try {
+     glue.createTable(
       new CreateTableRequest()
         .withCatalogId(catalogId)
         .withDatabaseName(db)
         .withTableInput(catalogTableToTableInput(tableDefinition))
     )
+    } catch {
+      case _ : AlreadyExistsException => {
+        if(!ignoreIfExists){
+          throw new TableAlreadyExistsException(db,tableDefinition.identifier.table)
+        }
+      }
+
+    }
   }
 
   override def dropTable(db: String, table: String, ignoreIfNotExists: Boolean, purge: Boolean): Unit = ???
