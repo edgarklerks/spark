@@ -16,25 +16,92 @@
  */
 package org.apache.spark.sql.glue
 
-import com.amazonaws.auth.DefaultAWSCredentialsProviderChain
+import java.net.URI
+import java.util.Date
+
 import com.amazonaws.services.glue.AWSGlueClientBuilder
-import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, CreateDatabaseRequest, DatabaseInput, DeleteDatabaseRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabasesRequest, GetTablesRequest, GetTablesResult, Table}
+import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, Column, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTablesRequest, GetTablesResult, SerDeInfo, StorageDescriptor, Table, TableInput, UpdateDatabaseRequest}
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogTable, CatalogTablePartition, ExternalCatalog}
+import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogStorageFormat, CatalogTable, CatalogTablePartition, ExternalCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.glue.GlueExternalCatalog.ToIterable
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{BooleanType, CharType, StringType, StructType, VarcharType}
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 private[spark] object GlueExternalCatalog {
-  val catalogIdOption = "spark.sql.metastore.glue.catalogid"
+  private val catalogIdOption = "spark.sql.metastore.glue.catalogid"
+  private val sts = AWSSecurityTokenServiceClientBuilder.defaultClient()
+  private val glue = AWSGlueClientBuilder.defaultClient()
 
-  def ignoreIfEntityExist(ignore : Boolean)(x : => Unit) : Unit = {
+  private val currentDatabase = new ThreadLocal[Option[String]] {
+    override def initialValue(): Option[String] = None
+  }
+
+  private def getCurrentDatabase(db: Option[String]): String = {
+    val dbName = db.orElse(currentDatabase.get())
+    assert(dbName.isDefined)
+    dbName.get
+  }
+
+  case class GlueColumns(schema: StructType, bucketSpec: Option[BucketSpec], partitionColumnNames : Seq[String]) {
+    val bucketColumns: Seq[String] = bucketSpec.toSeq.flatMap(_.bucketColumnNames)
+    private val allColumns = schema.map(col => {
+      new Column()
+        .withName(col.name)
+        .withType(col.dataType.catalogString)
+    })
+    val columns = allColumns.filterNot(partitionColumnNames.contains(_))
+    val partitionKeys = allColumns.filterNot(partitionColumnNames.contains(_))
+  }
+
+
+  /**
+   * TODO: Fill in serde info and sort columns
+   * @param catalogStorageFormat
+   * @param glueColumns
+   * @return
+   */
+  private def storageToStorageDescriptor(catalogStorageFormat: CatalogStorageFormat, glueColumns: GlueColumns) : StorageDescriptor = {
+   val storageDescriptor =  new StorageDescriptor()
+        .withBucketColumns(glueColumns.bucketColumns.asJavaCollection)
+        .withColumns(glueColumns.columns.asJavaCollection)
+        .withCompressed(catalogStorageFormat.compressed)
+    catalogStorageFormat.inputFormat match {
+      case None =>
+      case Some(inp) => storageDescriptor.setInputFormat(inp)
+    }
+
+    catalogStorageFormat.locationUri match {
+      case None =>
+      case Some(uri) => storageDescriptor.setLocation(uri.toASCIIString)
+    }
+    catalogStorageFormat.outputFormat match {
+      case None =>
+      case Some(out) => storageDescriptor.setOutputFormat(out)
+    }
+    storageDescriptor
+      .withParameters(catalogStorageFormat.properties.asJava)
+      .withSerdeInfo(???)
+      .withSortColumns(???)
+  }
+
+  private def catalogTableToTableInput(catalogTable: CatalogTable) : TableInput = {
+    val glueColumns  = GlueColumns(catalogTable.schema,catalogTable.bucketSpec,catalogTable.partitionColumnNames)
+    val tblInput = new TableInput()
+      .withName(catalogTable.identifier.table)
+      .withParameters(catalogTable.ignoredProperties.asJava)
+      .withLastAccessTime(new Date(catalogTable.lastAccessTime))
+      .withPartitionKeys(glueColumns.partitionKeys.asJavaCollection)
+      .withStorageDescriptor(storageToStorageDescriptor(catalogTable.storage, glueColumns))
+      .withTableType(catalogTable.tableType.name)
+    tblInput
+  }
+
+  private def ignoreIfEntityExist(ignore : Boolean)(x : => Unit) : Unit = {
     try {
       x
     } catch {
@@ -52,13 +119,13 @@ private[spark] object GlueExternalCatalog {
       }
     }
   }
-  trait ToIterable[V] {
+  private trait ToIterable[V] {
     /**
      * Q is the supertype of S, it defines that S at least should have the following two methods:
      */
     type Q = {
-      def getNextToken()
-      def withNextToken(token: String)
+      def getNextToken() : String
+      def withNextToken(token: String) : S
     }
 
     /**
@@ -88,26 +155,28 @@ private[spark] object GlueExternalCatalog {
      * @param s thing S containing some V's
      * @return one page of iterable V
      */
-    def getV(s: S): Iterable[V]
+    protected def getV(s: S): Iterable[V]
   }
 
   private val getTablesIterable = new ToIterable[Table] {
     override type S = GetTablesResult
+    override protected def getV(s: GetTablesResult): Iterable[Table] = s.getTableList.asScala
+  }
+  private val getDatabasesIterable = new ToIterable[Database] {
+    override type S = GetDatabasesResult
+    override protected def getV(s: GetDatabasesResult): Iterable[Database] = s.getDatabaseList.asScala
 
-    override def getV(s: GetTablesResult): Iterable[Table] = s.getTableList.asScala
   }
 }
 private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatalog {
   import GlueExternalCatalog._
-   private val credentials = DefaultAWSCredentialsProviderChain.getInstance()
-   private val sts = AWSSecurityTokenServiceClientBuilder.defaultClient()
-   private val glue  = AWSGlueClientBuilder.defaultClient()
-   private val catalogId = conf.getOption(catalogId)
-     .getOrElse(
-       sts.getCallerIdentity(
-         new GetCallerIdentityRequest()
-       ).getAccount
-     )
+
+  private lazy val catalogId = conf.getOption(catalogId)
+    .getOrElse(
+      sts.getCallerIdentity(
+        new GetCallerIdentityRequest()
+      ).getAccount
+    )
 
   override def createDatabase(
                                dbDefinition: CatalogDatabase,
@@ -165,21 +234,70 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * Note: If the underlying implementation does not support altering a certain field,
    * this becomes a no-op.
    */
-  override def alterDatabase(dbDefinition: CatalogDatabase): Unit = Unit
-
-  override def getDatabase(db: String): CatalogDatabase = {
-      ???
+  override def alterDatabase(dbDefinition: CatalogDatabase): Unit = {
+    glue.updateDatabase(
+      new UpdateDatabaseRequest()
+        .withCatalogId(catalogId)
+        .withName(dbDefinition.name)
+        .withDatabaseInput(
+          new DatabaseInput()
+            .withName(dbDefinition.name)
+            .withDescription(dbDefinition.description)
+            .withLocationUri(dbDefinition.locationUri.toASCIIString)
+            .withParameters(dbDefinition.properties.asJava)
+        )
+    )
   }
 
-  override def databaseExists(db: String): Boolean = ???
+  override def getDatabase(db: String): CatalogDatabase = {
+    val dbResult = glue.getDatabase(new GetDatabaseRequest().withCatalogId(catalogId).withName(db)).getDatabase
+    CatalogDatabase(dbResult.getName,dbResult.getDescription,URI.create(dbResult.getLocationUri),dbResult.getParameters.asScala.toMap)
+  }
 
-  override def listDatabases(): Seq[String] = ???
+  override def databaseExists(db: String): Boolean = {
+    try {
+      glue.getDatabase(new GetDatabaseRequest()
+        .withCatalogId(catalogId)
+        .withName(db)
+      )
+      true
+    } catch {
+      case e : EntityNotFoundException => false
+    }
+  }
 
-  override def listDatabases(pattern: String): Seq[String] = ???
+  private def getDatabases() : Iterable[Database] = {
+    val databases = glue.getDatabases(new GetDatabasesRequest().withCatalogId(catalogId))
+    getDatabasesIterable(databases)
+  }
+  override def listDatabases(): Seq[String] = {
+    getDatabases().map(_.getName).toSeq
+  }
 
-  override def setCurrentDatabase(db: String): Unit = ???
+  /**
+   * Assumed `pattern` is a prefix.
+   * @param pattern
+   * @return
+   */
+  override def listDatabases(pattern: String): Seq[String] = {
+    listDatabases().filter(q => q.startsWith(pattern))
+  }
 
-  override def createTable(tableDefinition: CatalogTable, ignoreIfExists: Boolean): Unit = ???
+
+  override def setCurrentDatabase(db: String): Unit = {
+    currentDatabase.set(Some(db))
+  }
+
+  override def createTable(tableDefinition: CatalogTable, ignoreIfExists: Boolean): Unit = {
+    val db = getCurrentDatabase(tableDefinition.identifier.database)
+
+    glue.createTable(
+      new CreateTableRequest()
+        .withCatalogId(catalogId)
+        .withDatabaseName(db)
+        .withTableInput(catalogTableToTableInput(tableDefinition))
+    )
+  }
 
   override def dropTable(db: String, table: String, ignoreIfNotExists: Boolean, purge: Boolean): Unit = ???
 
