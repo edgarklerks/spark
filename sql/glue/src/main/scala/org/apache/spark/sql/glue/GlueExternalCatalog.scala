@@ -24,20 +24,32 @@ import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTab
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{DatabaseAlreadyExistsException, TableAlreadyExistsException}
-import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogStorageFormat, CatalogTable, CatalogTablePartition, ExternalCatalog}
+import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogStorageFormat, CatalogTable, CatalogTablePartition, CatalogTableType, ExternalCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.types.StructType
+import org.json4s._
+import org.json4s.DefaultFormats
+import org.json4s.jackson.Serialization
+import org.json4s.jackson.Serialization.{read, write}
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 private[spark] object GlueExternalCatalog {
+  private val sparkSqlPrefix = "spark.sql"
+  private val glueMetastorePrefix = s"${sparkSqlPrefix}.glue"
   /**
    * Used to set an explicit catalog id. If not set in the options then the current aws account id is assumed.
    */
-  private val catalogIdOption = "spark.sql.metastore.glue.catalogid"
+  private val catalogIdOption = s"${glueMetastorePrefix}.catalogid"
+
+  /**
+   * Used to store the statistics
+   */
+  private val glueMetastoreStatisticsOption = s"${glueMetastorePrefix}.stats"
   /**
    * The clients should be thread safe, so can be shared.
    */
@@ -163,6 +175,24 @@ private[spark] object GlueExternalCatalog {
       .withStorageDescriptor(storageToStorageDescriptor(catalogTable.storage, glueColumns))
       .withTableType(catalogTable.tableType.name)
     tblInput
+  }
+
+  private def storageDescriptorToCatalogStorageFormat(storageDescriptor: StorageDescriptor) : CatalogStorageFormat = {
+    ???
+  }
+
+  /**
+   * Transforms a [[Table]] into a [[CatalogTable]]
+   * @param table
+   * @return
+   */
+  private def tableToCatalogTable(table : Table) : CatalogTable = {
+    CatalogTable(
+      new TableIdentifier(table.getName, Some(table.getDatabaseName)),
+      CatalogTableType.apply(table.getTableType),
+      storageDescriptorToCatalogStorageFormat(table.getStorageDescriptor),
+      StructType.fromString(table.getTableType)
+    )
   }
 
   /**
@@ -484,14 +514,37 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
 
     glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(catalogTableToTableInput(tableDefinition)))
 
-
-
   }
 
   /** Alter the statistics of a table. If `stats` is None, then remove all existing statistics. */
-  override def alterTableStats(db: String, table: String, stats: Option[CatalogStatistics]): Unit = ???
+  override def alterTableStats(db: String, table: String, stats: Option[CatalogStatistics]): Unit = {
+    requireDbExists(db)
+    requireTableExists(db, table)
 
-  override def getTable(db: String, table: String): CatalogTable = ???
+    val glueTable = glue.getTable(new GetTableRequest().withCatalogId(catalogId).withDatabaseName(db).withName(table)).getTable
+    val tableInput = tableToTableInput(glueTable)
+    val parameters = tableInput.getParameters
+
+    stats match {
+      case None => parameters.remove(glueMetastoreStatisticsOption)
+      case Some(stats) => parameters.put(glueMetastoreStatisticsOption, write[CatalogStatistics](stats)(DefaultFormats))
+    }
+
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(tableInput.withParameters(parameters)))
+
+  }
+
+  override def getTable(db: String, table: String): CatalogTable = {
+    requireDbExists(db)
+    requireTableExists(db,table)
+    val glueTable = glue.getTable(new GetTableRequest()
+        .withCatalogId(catalogId)
+        .withDatabaseName(db)
+        .withName(table)
+    ).getTable
+    tableToCatalogTable(glueTable)
+
+  }
 
   override def getTablesByName(db: String, tables: Seq[String]): Seq[CatalogTable] = ???
 
