@@ -187,12 +187,7 @@ private[spark] object GlueExternalCatalog {
    * @return
    */
   private def tableToCatalogTable(table : Table) : CatalogTable = {
-    CatalogTable(
-      new TableIdentifier(table.getName, Some(table.getDatabaseName)),
-      CatalogTableType.apply(table.getTableType),
-      storageDescriptorToCatalogStorageFormat(table.getStorageDescriptor),
-      StructType.fromString(table.getTableType)
-    )
+    ???
   }
 
   /**
