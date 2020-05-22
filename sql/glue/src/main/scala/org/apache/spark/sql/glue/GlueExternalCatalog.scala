@@ -18,20 +18,87 @@ package org.apache.spark.sql.glue
 
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain
 import com.amazonaws.services.glue.AWSGlueClientBuilder
-import com.amazonaws.services.glue.model.{CreateDatabaseRequest, DatabaseInput}
+import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, CreateDatabaseRequest, DatabaseInput, DeleteDatabaseRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabasesRequest, GetTablesRequest, GetTablesResult, Table}
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogTable, CatalogTablePartition, ExternalCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.glue.GlueExternalCatalog.ToIterable
 import org.apache.spark.sql.types.StructType
+
+import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
-object GlueExternalCatalog {
+private[spark] object GlueExternalCatalog {
   val catalogIdOption = "spark.sql.metastore.glue.catalogid"
+
+  def ignoreIfEntityExist(ignore : Boolean)(x : => Unit) : Unit = {
+    try {
+      x
+    } catch {
+      case e : AlreadyExistsException => {
+        if(!ignore){throw e}
+      }
+    }
+  }
+  def ignoreIfEntityNotExist(ignore : Boolean)(x : => Unit) : Unit = {
+    try {
+      x
+    } catch {
+      case e : EntityNotFoundException => {
+        if(!ignore){ throw e}
+      }
+    }
+  }
+  trait ToIterable[V] {
+    /**
+     * Q is the supertype of S, it defines that S at least should have the following two methods:
+     */
+    type Q = {
+      def getNextToken()
+      def withNextToken(token: String)
+    }
+
+    /**
+     * Tell the compiler to check that S is a subtype of Q
+     * in java language: it means S has the interface defined above (getNextToken...)
+     */
+    type S <: Q
+
+    /**
+     * Use getV to get one page, then ask for a new token and recurse if not null, otherwise return results
+     * Call is tail recursive
+     *
+     * @param q  the thing S containing V
+     * @param xs the already collected results (not for the user to call)
+     * @return
+     */
+    @tailrec
+    final def apply(q: S, xs: Iterable[V] = Iterable.empty): Iterable[V] = {
+      val res = getV(q)
+      val newToken = q.getNextToken()
+      if (newToken != null) apply(q.withNextToken(newToken), res ++ xs) else res ++ xs
+    }
+
+    /**
+     * Method the user should implement, it describe how to get one page of items.
+     *
+     * @param s thing S containing some V's
+     * @return one page of iterable V
+     */
+    def getV(s: S): Iterable[V]
+  }
+
+  private val getTablesIterable = new ToIterable[Table] {
+    override type S = GetTablesResult
+
+    override def getV(s: GetTablesResult): Iterable[Table] = s.getTableList.asScala
+  }
 }
 private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatalog {
+  import GlueExternalCatalog._
    private val credentials = DefaultAWSCredentialsProviderChain.getInstance()
    private val sts = AWSSecurityTokenServiceClientBuilder.defaultClient()
    private val glue  = AWSGlueClientBuilder.defaultClient()
@@ -42,21 +109,54 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
        ).getAccount
      )
 
-  override def createDatabase(dbDefinition: CatalogDatabase, ignoreIfExists: Boolean): Unit = {
-    glue.createDatabase(
-      new CreateDatabaseRequest()
-        .withCatalogId(catalogId)
-        .withDatabaseInput(
-          new DatabaseInput()
-            .withName(dbDefinition.name)
-            .withLocationUri(dbDefinition.locationUri.toASCIIString)
-            .withParameters(dbDefinition.properties.asJava)
-            .withDescription(dbDefinition.description)
-        )
-    )
+  override def createDatabase(
+                               dbDefinition: CatalogDatabase,
+                               ignoreIfExists: Boolean): Unit =
+    ignoreIfEntityExist(ignoreIfExists) {
+
+      glue.createDatabase(
+        new CreateDatabaseRequest()
+          .withCatalogId(catalogId)
+          .withDatabaseInput(
+            new DatabaseInput()
+              .withName(dbDefinition.name)
+              .withLocationUri(dbDefinition.locationUri.toASCIIString)
+              .withParameters(dbDefinition.properties.asJava)
+              .withDescription(dbDefinition.description)
+          )
+      )
+    }
+
+  private def getTables(db : String, expression : Option[String]) : Iterable[Table] = {
+    val getTablesRequest = (expression  match {
+      case Some(expr) =>
+        new GetTablesRequest().withExpression(expr)
+      case None => new GetTablesRequest()
+    }).withCatalogId(catalogId).withDatabaseName(db)
+    getTablesIterable(glue.getTables(getTablesRequest))
   }
 
-  override def dropDatabase(db: String, ignoreIfNotExists: Boolean, cascade: Boolean): Unit = ???
+  override def dropDatabase(
+                             db: String,
+                             ignoreIfNotExists: Boolean,
+                             cascade: Boolean): Unit = {
+    if(cascade){
+      val tables = this.getTables(db, None).map(_.getName)
+      glue.batchDeleteTable(
+        new BatchDeleteTableRequest()
+          .withCatalogId(catalogId)
+          .withDatabaseName(db)
+          .withTablesToDelete(tables.asJavaCollection)
+      )
+    }
+    ignoreIfEntityNotExist(ignoreIfNotExists){
+      glue.deleteDatabase(
+        new DeleteDatabaseRequest()
+          .withCatalogId(catalogId)
+          .withName(db)
+      )
+    }
+  }
 
   /**
    * Alter a database whose name matches the one specified in `dbDefinition`,
@@ -65,9 +165,11 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * Note: If the underlying implementation does not support altering a certain field,
    * this becomes a no-op.
    */
-  override def alterDatabase(dbDefinition: CatalogDatabase): Unit = ???
+  override def alterDatabase(dbDefinition: CatalogDatabase): Unit = Unit
 
-  override def getDatabase(db: String): CatalogDatabase = ???
+  override def getDatabase(db: String): CatalogDatabase = {
+      ???
+  }
 
   override def databaseExists(db: String): Boolean = ???
 
