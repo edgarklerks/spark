@@ -178,6 +178,8 @@ private[spark] object GlueExternalCatalog {
   }
 
   private def storageDescriptorToCatalogStorageFormat(storageDescriptor: StorageDescriptor) : CatalogStorageFormat = {
+    // Use [[DataType.fromDDL]] to parse the types of the individual columns, then merge again into one StructType
+    // This way we don't need to store the schema into the properties of the table
     ???
   }
 
