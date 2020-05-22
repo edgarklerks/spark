@@ -20,7 +20,7 @@ import java.net.URI
 import java.util.Date
 
 import com.amazonaws.services.glue.AWSGlueClientBuilder
-import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, Column, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTablesRequest, GetTablesResult, SerDeInfo, StorageDescriptor, Table, TableInput, UpdateDatabaseRequest}
+import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, Column, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, DeleteTableRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTableRequest, GetTablesRequest, GetTablesResult, SerDeInfo, StorageDescriptor, Table, TableInput, UpdateDatabaseRequest, UpdateTableRequest}
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
@@ -165,6 +165,39 @@ private[spark] object GlueExternalCatalog {
     tblInput
   }
 
+  /**
+   * Table and TableInput contain the same information, but of course there is no method to convert between them.
+   * Amazon seems to generate their SDK's from their rest API, which explains a couple of things (like the several redefinitions of the
+   * idea of a Tag throughout the aws sdk).
+   * @param table
+   * @return
+   */
+  private def tableToTableInput(table : Table) : TableInput = {
+    new TableInput()
+      .withDescription(table.getDescription)
+      .withLastAccessTime(table.getLastAccessTime)
+      .withLastAnalyzedTime(table.getLastAnalyzedTime)
+      .withName(table.getName)
+      .withOwner(table.getOwner)
+      .withParameters(table.getParameters)
+      .withPartitionKeys(table.getPartitionKeys)
+      .withRetention(table.getRetention)
+      .withStorageDescriptor(table.getStorageDescriptor)
+      .withTableType(table.getTableType)
+      .withViewExpandedText(table.getViewExpandedText)
+      .withViewOriginalText(table.getViewOriginalText)
+  }
+
+  /**
+   * Amazon has forgotten to create iterables for its types, so you have to write the same code to loop over
+   * pages returned by the API over and over again.
+   * This resolves by exploiting that every type Amazon uses, has an implicit interface. This interface is expressed by Q.
+   * Unfortunately, every object has its own method name to get the values you are interested in.
+   *
+   * Except for S3, because that has a slightly different structure, so it doesn't fit the Q type
+   *
+   * @tparam V The result type, e.g. if {{{ type S = GetTablesResult }}} then {{{ type V = Table }}}
+   */
   private trait ToIterable[V] {
     /**
      * Q is the supertype of S, it defines that S at least should have the following two methods:
@@ -257,6 +290,13 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     getTablesIterable(glue.getTables(getTablesRequest))
   }
 
+  /**
+   * Drop databases drops the database if it is empty or drops it with all tables if cascade is set.
+   * Note that glue won't delete data. So the data will still be available.
+   * @param db Database name
+   * @param ignoreIfNotExists if this is set, won't throw exception when database doesn't exist
+   * @param cascade if set removes first all table definitions before removing database
+   */
   override def dropDatabase(
                              db: String,
                              ignoreIfNotExists: Boolean,
@@ -292,6 +332,9 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * this becomes a no-op.
    */
   override def alterDatabase(dbDefinition: CatalogDatabase): Unit = {
+
+    requireDbExists(dbDefinition.name)
+
     glue.updateDatabase(
       new UpdateDatabaseRequest()
         .withCatalogId(catalogId)
@@ -307,6 +350,8 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
   }
 
   override def getDatabase(db: String): CatalogDatabase = {
+    requireDbExists(db)
+
     val dbResult = glue.getDatabase(new GetDatabaseRequest().withCatalogId(catalogId).withName(db)).getDatabase
     CatalogDatabase(dbResult.getName,dbResult.getDescription,URI.create(dbResult.getLocationUri),dbResult.getParameters.asScala.toMap)
   }
@@ -332,12 +377,12 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
   }
 
   /**
-   * Assumed `pattern` is a prefix.
+   * If pattern is found in the name of a database, include it in the listing.
    * @param pattern
    * @return
    */
   override def listDatabases(pattern: String): Seq[String] = {
-    listDatabases().filter(q => q.startsWith(pattern))
+    listDatabases().filter(q => q.contains(pattern))
   }
 
 
@@ -346,6 +391,8 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * @param db database name
    */
   override def setCurrentDatabase(db: String): Unit = {
+    requireDbExists(db)
+
     currentDatabase.set(Some(db))
   }
 
@@ -357,6 +404,8 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    */
   override def createTable(tableDefinition: CatalogTable, ignoreIfExists: Boolean): Unit = {
     val db = getCurrentDatabase(tableDefinition.identifier.database)
+    requireDbExists(db)
+
     try {
      glue.createTable(
       new CreateTableRequest()
@@ -374,9 +423,32 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     }
   }
 
-  override def dropTable(db: String, table: String, ignoreIfNotExists: Boolean, purge: Boolean): Unit = ???
+  /**
+   * Drops the table definition from the database table. Note that glue *won't* delete the data. This also means purge won't do
+   * anything.
+   * @param db name fo the database the table resides in
+   * @param table name of the table to be deleted
+   * @param ignoreIfNotExists do not throw exceptions if table doesn't exist
+   * @param purge ignored
+   */
+  override def dropTable(db: String, table: String, ignoreIfNotExists: Boolean, purge: Boolean): Unit = {
+    if(!ignoreIfNotExists){
+      requireDbExists(db)
+      requireTableExists(db,table)
+    }
+    glue.deleteTable(new DeleteTableRequest().withCatalogId(catalogId).withDatabaseName(db).withName(table))
+  }
 
-  override def renameTable(db: String, oldName: String, newName: String): Unit = ???
+  override def renameTable(db: String, oldName: String, newName: String): Unit = {
+    requireDbExists(db)
+    requireTableExists(db, oldName)
+
+    val table : Table = glue.getTable(new GetTableRequest().withCatalogId(catalogId).withDatabaseName(db).withName(newName)).getTable
+
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(
+      tableToTableInput(table).withName(newName)
+    ))
+  }
 
   /**
    * Alter a table whose database and name match the ones specified in `tableDefinition`, assuming
@@ -386,7 +458,14 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * Note: If the underlying implementation does not support altering a certain field,
    * this becomes a no-op.
    */
-  override def alterTable(tableDefinition: CatalogTable): Unit = ???
+  override def alterTable(tableDefinition: CatalogTable): Unit = {
+    val db = getCurrentDatabase(tableDefinition.identifier.database)
+    requireDbExists(db)
+    requireTableExists(db, tableDefinition.identifier.table)
+
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(catalogTableToTableInput(tableDefinition)))
+
+  }
 
   /**
    * Alter the data schema of a table identified by the provided database and table name. The new
@@ -397,7 +476,17 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
    * @param table         Name of table to alter schema for
    * @param newDataSchema Updated data schema to be used for the table.
    */
-  override def alterTableDataSchema(db: String, table: String, newDataSchema: StructType): Unit = ???
+  override def alterTableDataSchema(db: String, table: String, newDataSchema: StructType): Unit = {
+    requireDbExists(db)
+    requireTableExists(db, table)
+
+    val tableDefinition = getTable(db, table).copy(schema = newDataSchema)
+
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(catalogTableToTableInput(tableDefinition)))
+
+
+
+  }
 
   /** Alter the statistics of a table. If `stats` is None, then remove all existing statistics. */
   override def alterTableStats(db: String, table: String, stats: Option[CatalogStatistics]): Unit = ???
