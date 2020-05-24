@@ -17,28 +17,24 @@
 package org.apache.spark.sql.glue
 
 import java.net.URI
-import java.util.Date
 
 import com.amazonaws.services.glue.AWSGlueClientBuilder
-import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, Column, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, DeleteTableRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTableRequest, GetTablesRequest, GetTablesResult, SerDeInfo, StorageDescriptor, Table, TableInput, UpdateDatabaseRequest, UpdateTableRequest}
+import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, DeleteTableRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTableRequest, GetTablesRequest, GetTablesResult, Table, UpdateDatabaseRequest, UpdateTableRequest}
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{DatabaseAlreadyExistsException, TableAlreadyExistsException}
-import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogStorageFormat, CatalogTable, CatalogTablePartition, CatalogTableType, ExternalCatalog}
+import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogFunction, CatalogStatistics, CatalogTable, CatalogTablePartition, ExternalCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.Histogram
+import org.apache.spark.sql.glue.conversions.{CatalogTableToTableInput, TableToCatalogTable, TableToTableInput}
+import org.apache.spark.sql.glue.util.{AWS, Stats}
 import org.apache.spark.sql.types.StructType
-import org.json4s._
 import org.json4s.DefaultFormats
-import org.json4s.jackson.Serialization
-import org.json4s.jackson.Serialization.{read, write}
+import org.json4s.jackson.Serialization.write
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
-import scala.collection.mutable
 
 private[spark] object GlueExternalCatalog {
   private val sparkSqlPrefix = "spark.sql"
@@ -48,15 +44,6 @@ private[spark] object GlueExternalCatalog {
    */
   private val catalogIdOption = s"${glueMetastorePrefix}.catalogid"
 
-  /**
-   * Used to store the statistics
-   */
-  private val glueMetastoreStatisticsOption = s"${glueMetastorePrefix}.stats"
-  private val glueMetastoreTableStatisticsOption = s"${glueMetastoreStatisticsOption}.table"
-  private val glueMetastoreTableRowCountStatisticsOption = s"${glueMetastoreTableStatisticsOption}.row_count"
-  private val glueMetastoreTableByteSizeStatisticsOption = s"${glueMetastoreTableStatisticsOption}.byte_size"
-
-  private val glueMetastoreColumnsStatisticsOption = s"${glueMetastoreStatisticsOption}.columns"
   /**
    * The clients should be thread safe, so can be shared.
    */
@@ -82,250 +69,9 @@ private[spark] object GlueExternalCatalog {
     dbName.get
   }
 
-  /**
-   * Intermediate type that combines all the information needed to create a TableInput
-   * @param schema a Structype representing the schema of the table
-   * @param bucketSpec a bucket specification, may be null
-   * @param partitionColumnNames the names of the partition columns
-   */
-  case class GlueColumns(private val schema: StructType, private val bucketSpec: Option[BucketSpec], private val partitionColumnNames : Seq[String]) {
-    val hasBucketSpec = bucketSpec.isDefined
-    /** Set to safe values we can always feed to glue without hurting ourselves  */
-    val numberOfBucketColumns = bucketSpec.map(_.numBuckets).getOrElse(0)
-    /** Bucket columns may be empty */
-    val bucketColumns: Seq[String] = bucketSpec.toSeq.flatMap(_.bucketColumnNames)
-    /**
-     * Not sure yet if spark and glue are fully compatible, so perhaps not all columns are supported.
-     * TODO: Needs to be tested
-     */
-    private val allColumns = schema.map(col => {
-      new Column()
-        .withName(col.name)
-        .withType(col.dataType.catalogString)
-    })
-    val columns = allColumns.filterNot(partitionColumnNames.contains(_))
-    /**
-     * In glue it seems the partition columns are not part of the normal columns, so they need to be divided.
-     * Also the partition columns need to carry their type, because they are not part of the normal columns
-     */
-    val partitionKeys = allColumns.filterNot(partitionColumnNames.contains(_))
-  }
 
-
-  /**
-   * Converts a [[CatalogStorageFormat]] together with the columns ([[GlueColumns]] into a [[StorageDescriptor]]
-   * @param catalogStorageFormat the storage format of the table
-   * @param glueColumns the columns of the table
-   * @return a storage descriptor of the table
-   */
-  private def storageToStorageDescriptor(catalogStorageFormat: CatalogStorageFormat, glueColumns: GlueColumns) : StorageDescriptor = {
-
-   val storageDescriptor =  new StorageDescriptor()
-        .withColumns(glueColumns.columns.asJavaCollection)
-        .withCompressed(catalogStorageFormat.compressed)
-
-    if(glueColumns.hasBucketSpec){
-      storageDescriptor.setBucketColumns(glueColumns.bucketColumns.asJavaCollection)
-      storageDescriptor.setNumberOfBuckets(glueColumns.numberOfBucketColumns)
-    }
-
-    catalogStorageFormat.inputFormat match {
-      case None =>
-      case Some(inp) => storageDescriptor.setInputFormat(inp)
-    }
-
-    catalogStorageFormat.locationUri match {
-      case None =>
-      case Some(uri) => storageDescriptor.setLocation(uri.toASCIIString)
-    }
-    catalogStorageFormat.outputFormat match {
-      case None =>
-      case Some(out) => storageDescriptor.setOutputFormat(out)
-    }
-
-    /**
-     * For serde it is not needed to set all the properties, {{{catalogStorageFormat.serde}}} maps to the name of the serialization library used.
-     */
-    catalogStorageFormat.serde match {
-      case None =>
-      case Some(serdeLibName) => storageDescriptor.withSerdeInfo(new SerDeInfo().withSerializationLibrary(serdeLibName))
-    }
-
-    storageDescriptor
-      .withParameters(catalogStorageFormat.properties.asJava)
-  }
-
-  /**
-   * Transforms a [[CatalogTable]] into a [[TableInput]].
-   * @param catalogTable
-   * @return a tableInput describing the table
-   */
-  private def catalogTableToTableInput(catalogTable: CatalogTable) : TableInput = {
-
-    /**
-     * Computes the columns, partitionColumns and the bucketColumns
-     */
-    val glueColumns  = GlueColumns(catalogTable.schema,catalogTable.bucketSpec,catalogTable.partitionColumnNames)
-
-    /**
-     * withRetention and withLastAnalyzedTime are not set, because there doesn't seem to be anything in [[CatalogTable]] that I can map
-     */
-    val tblInput = new TableInput()
-      .withName(catalogTable.identifier.table)
-      /**
-       * I guess ignored parameters can be passed on? Perhaps I need to make a namespace for them spark.sql.glue
-       * TODO: Check if this causes problems
-       * */
-      .withParameters(catalogTable.ignoredProperties.asJava)
-      .withLastAccessTime(new Date(catalogTable.lastAccessTime))
-      .withPartitionKeys(glueColumns.partitionKeys.asJavaCollection)
-      .withStorageDescriptor(storageToStorageDescriptor(catalogTable.storage, glueColumns))
-      .withTableType(catalogTable.tableType.name)
-    tblInput
-  }
-
-  private def storageDescriptorToCatalogStorageFormat(storageDescriptor: StorageDescriptor) : CatalogStorageFormat = {
-    ???
-  }
-
-  /**
-   * Transforms a [[Table]] into a [[CatalogTable]]
-   * @param table
-   * @return
-   */
-  private def tableToCatalogTable(table : Table) : CatalogTable = {
-    // Use [[DataType.fromDDL]] to parse the types of the individual columns, then merge again into one StructType
-    // This way we don't need to store the schema into the properties of the table
-    ???
-  }
-
-  /**
-   * Table and TableInput contain the same information, but of course there is no method to convert between them.
-   * Amazon seems to generate their SDK's from their rest API, which explains a couple of things (like the several redefinitions of the
-   * idea of a Tag throughout the aws sdk).
-   * @param table
-   * @return
-   */
-  private def tableToTableInput(table : Table) : TableInput = {
-    new TableInput()
-      .withDescription(table.getDescription)
-      .withLastAccessTime(table.getLastAccessTime)
-      .withLastAnalyzedTime(table.getLastAnalyzedTime)
-      .withName(table.getName)
-      .withOwner(table.getOwner)
-      .withParameters(table.getParameters)
-      .withPartitionKeys(table.getPartitionKeys)
-      .withRetention(table.getRetention)
-      .withStorageDescriptor(table.getStorageDescriptor)
-      .withTableType(table.getTableType)
-      .withViewExpandedText(table.getViewExpandedText)
-      .withViewOriginalText(table.getViewOriginalText)
-  }
-
-  /**
-   * Update the statistics in the parameters map
-   * @param column column name the statistic belong to
-   * @param statname the name of the statistic.
-   * @param v the actual value, can be None, then the stat will be removed.
-   * @param parameters The current parameters as Map
-   * @return Update map
-   */
-  private def updateColumnStatToParameters(column: String)( statname : String,  v: Option[String], parameters : Map[String,String]) : Map[String,String] = {
-    val storeKey = s"${glueMetastoreColumnsStatisticsOption}.${column}.${statname}"
-    v.map(value => parameters + ((storeKey, value)))
-      .getOrElse(parameters - storeKey)
-  }
-
-  /**
-   * Stores the statitistics in human readable format per column and table.
-   * @param parameters
-   * @param stats
-   * @return
-   */
-  private def statsToParameters(parameters : Map[String,String], stats : Option[CatalogStatistics])  = {
-    stats match {
-
-      case None => parameters.filterKeys(k => !k.startsWith(glueMetastoreStatisticsOption))
-      case Some(stats) => {
-        val rowCount = stats.rowCount
-        val byteSize = stats.sizeInBytes
-        val tableStats = rowCount
-          .map(rc => parameters + ((glueMetastoreTableRowCountStatisticsOption + ".row_count", rc.toString()))).getOrElse(parameters - (glueMetastoreTableRowCountStatisticsOption))
-          .+((glueMetastoreTableByteSizeStatisticsOption,byteSize.toString()))
-
-        stats.colStats.foldLeft(tableStats){case (parameters, (k,cstats)) =>
-          val updater = updateColumnStatToParameters(k) _
-          updater("version", Some(cstats.version.toString),
-          updater("nullCount", cstats.nullCount.map(_.toString()),
-          updater("histogram", cstats.histogram.map(hist => write[Histogram](hist)(DefaultFormats)),
-          updater("distinctCount", cstats.distinctCount.map(_.toString),
-          updater("avgLen", cstats.avgLen.map(_.toString),
-          updater("min", cstats.min.map(_.toString),
-          updater("max",cstats.max.map(_.toString),parameters)))))))
-        }
-      }
-    }
-  }
-
-  /**
-   * Amazon has forgotten to create iterables for its types, so you have to write the same code to loop over
-   * pages returned by the API over and over again.
-   * This resolves by exploiting that every type Amazon uses, has an implicit interface. This interface is expressed by Q.
-   * Unfortunately, every object has its own method name to get the values you are interested in.
-   *
-   * Except for S3, because that has a slightly different structure, so it doesn't fit the Q type
-   *
-   * @tparam V The result type, e.g. if {{{ type S = GetTablesResult }}} then {{{ type V = Table }}}
-   */
-  private trait ToIterable[V] {
-    /**
-     * Q is the supertype of S, it defines that S at least should have the following two methods:
-     */
-    type Q = {
-      def getNextToken() : String
-      def withNextToken(token: String) : S
-    }
-
-    /**
-     * Tell the compiler to check that S is a subtype of Q
-     * in java language: it means S has the interface defined above (getNextToken...)
-     */
-    type S <: Q
-
-    /**
-     * Use getV to get one page, then ask for a new token and recurse if not null, otherwise return results
-     * Call is tail recursive
-     *
-     * @param q  the thing S containing V
-     * @param xs the already collected results (not for the user to call)
-     * @return
-     */
-    @tailrec
-    final def apply(q: S, xs: Iterable[V] = Iterable.empty): Iterable[V] = {
-      val res = getV(q)
-      val newToken = q.getNextToken()
-      if (newToken != null) apply(q.withNextToken(newToken), res ++ xs) else res ++ xs
-    }
-
-    /**
-     * Method the user should implement, it describe how to get one page of items.
-     *
-     * @param s thing S containing some V's
-     * @return one page of iterable V
-     */
-    protected def getV(s: S): Iterable[V]
-  }
-
-  private val getTablesIterable = new ToIterable[Table] {
-    override type S = GetTablesResult
-    override protected def getV(s: GetTablesResult): Iterable[Table] = s.getTableList.asScala
-  }
-  private val getDatabasesIterable = new ToIterable[Database] {
-    override type S = GetDatabasesResult
-    override protected def getV(s: GetDatabasesResult): Iterable[Database] = s.getDatabaseList.asScala
-
-  }
 }
+
 private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatalog {
   import GlueExternalCatalog._
 
@@ -366,7 +112,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
         new GetTablesRequest().withExpression(expr)
       case None => new GetTablesRequest()
     }).withCatalogId(catalogId).withDatabaseName(db)
-    getTablesIterable(glue.getTables(getTablesRequest))
+    AWS.getTablesIterable(glue.getTables(getTablesRequest))
   }
 
   /**
@@ -449,7 +195,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
 
   private def getDatabases() : Iterable[Database] = {
     val databases = glue.getDatabases(new GetDatabasesRequest().withCatalogId(catalogId))
-    getDatabasesIterable(databases)
+    AWS.getDatabasesIterable(databases)
   }
   override def listDatabases(): Seq[String] = {
     getDatabases().map(_.getName).toSeq
@@ -490,7 +236,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
       new CreateTableRequest()
         .withCatalogId(catalogId)
         .withDatabaseName(db)
-        .withTableInput(catalogTableToTableInput(tableDefinition))
+        .withTableInput(CatalogTableToTableInput(tableDefinition))
     )
     } catch {
       case _ : AlreadyExistsException => {
@@ -525,7 +271,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     val table : Table = glue.getTable(new GetTableRequest().withCatalogId(catalogId).withDatabaseName(db).withName(newName)).getTable
 
     glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(
-      tableToTableInput(table).withName(newName)
+      TableToTableInput(table).withName(newName)
     ))
   }
 
@@ -542,7 +288,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     requireDbExists(db)
     requireTableExists(db, tableDefinition.identifier.table)
 
-    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(catalogTableToTableInput(tableDefinition)))
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(CatalogTableToTableInput(tableDefinition)))
 
   }
 
@@ -561,7 +307,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
 
     val tableDefinition = getTable(db, table).copy(schema = newDataSchema)
 
-    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(catalogTableToTableInput(tableDefinition)))
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(CatalogTableToTableInput(tableDefinition)))
 
   }
 
@@ -571,9 +317,9 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     requireTableExists(db, table)
 
     val glueTable = glue.getTable(new GetTableRequest().withCatalogId(catalogId).withDatabaseName(db).withName(table)).getTable
-    val tableInput = tableToTableInput(glueTable)
-    val parameters = statsToParameters(tableInput.getParameters,stats)
-    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(tableInput.withParameters(parameters)))
+    val tableInput = TableToTableInput(glueTable)
+    val parameters = Stats.statsToParameters(tableInput.getParameters.asScala.toMap,stats)
+    glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(tableInput.withParameters(parameters.asJava)))
 
   }
 
@@ -585,7 +331,7 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
         .withDatabaseName(db)
         .withName(table)
     ).getTable
-    tableToCatalogTable(glueTable)
+    TableToCatalogTable(glueTable)
 
   }
 
