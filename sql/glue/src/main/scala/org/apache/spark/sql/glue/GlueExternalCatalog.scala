@@ -17,9 +17,10 @@
 package org.apache.spark.sql.glue
 
 import java.net.URI
+import java.util.Date
 
 import com.amazonaws.services.glue.AWSGlueClientBuilder
-import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchDeleteTableRequest, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, DeleteTableRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTableRequest, GetTablesRequest, GetTablesResult, Table, UpdateDatabaseRequest, UpdateTableRequest}
+import com.amazonaws.services.glue.model.{AlreadyExistsException, BatchCreatePartitionRequest, BatchDeleteTableRequest, CreateDatabaseRequest, CreateTableRequest, Database, DatabaseInput, DeleteDatabaseRequest, DeleteTableRequest, EntityNotFoundException, GetDatabaseRequest, GetDatabaseResult, GetDatabasesRequest, GetDatabasesResult, GetTableRequest, GetTablesRequest, GetTablesResult, PartitionInput, Table, UpdateDatabaseRequest, UpdateTableRequest}
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder
 import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest
 import org.apache.spark.SparkConf
@@ -28,7 +29,7 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogFunction, 
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.Histogram
-import org.apache.spark.sql.glue.conversions.{CatalogTableToTableInput, TableToCatalogTable, TableToTableInput}
+import org.apache.spark.sql.glue.conversions.{CatalogTableToStorageDescriptor, CatalogTableToTableInput, TableToCatalogTable, TableToTableInput}
 import org.apache.spark.sql.glue.util.{AWS, Stats}
 import org.apache.spark.sql.types.StructType
 import org.json4s.DefaultFormats
@@ -308,7 +309,6 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     val tableDefinition = getTable(db, table).copy(schema = newDataSchema)
 
     glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(CatalogTableToTableInput(tableDefinition)))
-
   }
 
   /** Alter the statistics of a table. If `stats` is None, then remove all existing statistics. */
@@ -320,7 +320,6 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
     val tableInput = TableToTableInput(glueTable)
     val parameters = Stats.statsToParameters(tableInput.getParameters.asScala.toMap,stats)
     glue.updateTable(new UpdateTableRequest().withCatalogId(catalogId).withDatabaseName(db).withTableInput(tableInput.withParameters(parameters.asJava)))
-
   }
 
   override def getTable(db: String, table: String): CatalogTable = {
@@ -332,40 +331,79 @@ private[spark] class GlueExternalCatalog(conf : SparkConf) extends ExternalCatal
         .withName(table)
     ).getTable
     TableToCatalogTable(glueTable)
+  }
+
+  override def getTablesByName(db: String, tables: Seq[String]): Seq[CatalogTable] = {
+
+    requireDbExists(db)
+    tables.foreach(requireTableExists(db,_))
+
+    tables.map {tableName =>
+      val tableResult = glue.getTable(
+        new GetTableRequest()
+          .withCatalogId(catalogId)
+          .withDatabaseName(db)
+          .withName(tableName)
+      )
+      TableToCatalogTable(tableResult.getTable)
+    }
+  }
+
+  override def tableExists(db: String, table: String): Boolean = {
+    try {
+      glue.getTable(
+        new GetTableRequest()
+          .withCatalogId(catalogId)
+          .withDatabaseName(db)
+          .withName(table)
+      )
+      true
+    } catch {
+      case _ : EntityNotFoundException => false
+    }
+  }
+
+  override def listTables(db: String): Seq[String] = {
+    getTables(db,None).map(_.getName).toSeq
+  }
+
+  override def listTables(db: String, pattern: String): Seq[String] = {
+    getTables(db,Some(pattern)).map(_.getName).toSeq
 
   }
 
-  override def getTablesByName(db: String, tables: Seq[String]): Seq[CatalogTable] = ???
-
-  override def tableExists(db: String, table: String): Boolean = ???
-
-  override def listTables(db: String): Seq[String] = ???
-
-  override def listTables(db: String, pattern: String): Seq[String] = ???
-
-  override def listViews(db: String, pattern: String): Seq[String] = ???
+  override def listViews(db: String, pattern: String): Seq[String] = {
+    Seq()
+  }
 
   /**
-   * Loads data into a table.
-   *
-   * @param isSrcLocal Whether the source data is local, as defined by the "LOAD DATA LOCAL"
-   *                   HiveQL command.
+   * The load commands don't make sense from the perspective of glue. I could still implement them though
    */
-  override def loadTable(db: String, table: String, loadPath: String, isOverwrite: Boolean, isSrcLocal: Boolean): Unit = ???
+  override def loadTable(db: String, table: String, loadPath: String, isOverwrite: Boolean, isSrcLocal: Boolean): Unit = return ()
 
-  /**
-   * Loads data into a partition.
-   *
-   * @param isSrcLocal Whether the source data is local, as defined by the "LOAD DATA LOCAL"
-   *                   HiveQL command.
-   */
-  override def loadPartition(db: String, table: String, loadPath: String, partition: TablePartitionSpec, isOverwrite: Boolean, inheritTableSpecs: Boolean, isSrcLocal: Boolean): Unit = ???
+  override def loadPartition(db: String, table: String, loadPath: String, partition: TablePartitionSpec, isOverwrite: Boolean, inheritTableSpecs: Boolean, isSrcLocal: Boolean): Unit = ()
 
-  override def loadDynamicPartitions(db: String, table: String, loadPath: String, partition: TablePartitionSpec, replace: Boolean, numDP: Int): Unit = ???
+  override def loadDynamicPartitions(db: String, table: String, loadPath: String, partition: TablePartitionSpec, replace: Boolean, numDP: Int): Unit = ()
 
-  override def createPartitions(db: String, table: String, parts: Seq[CatalogTablePartition], ignoreIfExists: Boolean): Unit = ???
 
-  override def dropPartitions(db: String, table: String, parts: Seq[TablePartitionSpec], ignoreIfNotExists: Boolean, purge: Boolean, retainData: Boolean): Unit = ???
+
+
+  override def createPartitions(db: String, table: String, parts: Seq[CatalogTablePartition], ignoreIfExists: Boolean): Unit = {
+    requireDbExists(db)
+    requireTableExists(db,table)
+
+    val catalogTable = getTable(db, table)
+
+    glue.batchCreatePartition(
+      new BatchCreatePartitionRequest()
+        .withCatalogId(catalogId)
+        .withDatabaseName(db)
+        .withTableName(table)
+        .withPartitionInputList(???)
+    )
+  }
+
+  override def dropPartitions(db: String, table: String, parts: Seq[TablePartitionSpec], ignoreIfNotExists: Boolean, purge: Boolean, retainData: Boolean): Unit = ()
 
   /**
    * Override the specs of one or many existing table partitions, assuming they exist.
